@@ -4,6 +4,7 @@ Utility functions for text processing and model detection.
 """
 
 import logging
+import os
 import re
 
 from .models import Message
@@ -95,6 +96,22 @@ def clean_output_text(text: str) -> str:
 
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
     text = text.strip()
+
+    # When thinking is disabled, strip all thinking content from the output.
+    # Some quantized models (e.g., Qwen3.5 4-bit) generate thinking text even
+    # when the chat template emits a pre-closed <think></think> block.
+    enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true").lower() in ("true", "1", "yes")
+    if not enable_thinking and "</think>" in text:
+        # Strip everything up to and including the last </think>
+        last_close = text.rfind("</think>")
+        text = text[last_close + len("</think>"):].strip()
+        # Also strip any remaining <think> tags
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        if not text:
+            # Model spent all tokens on thinking, no content produced
+            logger.warning("Model output was entirely thinking content (stripped). "
+                          "Consider increasing max_tokens.")
+        return text
 
     # Add opening <think> tag if response has closing but not opening
     # This happens when enable_thinking=True in the chat template
