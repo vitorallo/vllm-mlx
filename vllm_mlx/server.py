@@ -52,7 +52,7 @@ from collections.abc import AsyncIterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
@@ -591,13 +591,24 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
-    engine_stats = _engine.get_stats() if _engine else {}
+    if _engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "model_loaded": False,
+                "model_name": _model_name,
+                "mcp": mcp_info,
+            },
+        )
+
+    engine_stats = _engine.get_stats()
 
     return {
         "status": "healthy",
-        "model_loaded": _engine is not None,
+        "model_loaded": True,
         "model_name": _model_name,
-        "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
+        "model_type": "mllm" if _engine.is_mllm else "llm",
         "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
