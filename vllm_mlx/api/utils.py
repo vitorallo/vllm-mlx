@@ -99,45 +99,13 @@ def clean_output_text(text: str) -> str:
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
     text = text.strip()
 
-    # When thinking is disabled, strip all thinking content from the output.
-    # Some quantized models (e.g., Qwen3.5 4-bit) generate thinking text even
-    # when the chat template emits a pre-closed <think></think> block.
-    # The model may output thinking either as <think>...</think> tags OR as
-    # plain text starting with "Thinking Process:" or similar patterns.
+    # When thinking is disabled, strip <think> tag content only.
+    # Plain-text thinking (Qwen3.5 "Thinking Process:...") is handled by the client parser.
     enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true").lower() in ("true", "1", "yes")
-    if not enable_thinking:
-        # Case 1: thinking in <think> tags
-        if "</think>" in text:
-            last_close = text.rfind("</think>")
-            text = text[last_close + len("</think>"):].strip()
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        # Case 2: thinking as plain text before JSON (Qwen3.5 pattern)
-        # The model outputs "Thinking Process:\n..." then eventually produces JSON
-        if text and not text.startswith("{") and not text.startswith("["):
-            # Find the last top-level JSON object in the output
-            last_brace = text.rfind("}")
-            if last_brace != -1:
-                # Walk backwards to find the matching opening brace
-                depth = 0
-                for i in range(last_brace, -1, -1):
-                    if text[i] == "}":
-                        depth += 1
-                    elif text[i] == "{":
-                        depth -= 1
-                        if depth == 0:
-                            json_candidate = text[i:last_brace + 1]
-                            try:
-                                import json
-                                json.loads(json_candidate)
-                                text = json_candidate
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-                            break
-
-        if not text:
-            logger.warning("Model output was entirely thinking content (stripped). "
-                          "Consider increasing max_tokens.")
+    if not enable_thinking and "</think>" in text:
+        last_close = text.rfind("</think>")
+        text = text[last_close + len("</think>"):].strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         return text
 
     # Add opening <think> tag if response has closing but not opening
