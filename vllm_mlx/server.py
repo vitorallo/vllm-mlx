@@ -660,11 +660,24 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
+    # Check memory pressure (foil-patch)
+    memory_warning = None
+    try:
+        import mlx.core as mx
+        metal = mx.metal
+        active_gb = metal.get_active_memory() / (1024**3)
+        peak_gb = metal.get_peak_memory() / (1024**3)
+        if active_gb > 0.8 * (peak_gb + 2):  # >80% of available
+            memory_warning = f"high_memory_pressure: {active_gb:.1f}GB active"
+    except Exception:
+        pass
+
     return {
         "status": "healthy",
         "model_loaded": _engine is not None,
         "model_name": _model_name,
         "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
+        "memory_warning": memory_warning,
         "mcp": mcp_info,
     }
 
