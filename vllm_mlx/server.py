@@ -663,6 +663,29 @@ async def cache_stats():
         return {"error": "Cache stats not available (mlx_vlm not loaded)"}
 
 
+@app.post("/v1/reset")
+async def reset_engine():
+    """Deep reset: clear all KV caches, prefix caches, and reclaim GPU memory."""
+    engine = get_engine()
+    if engine is None:
+        return {"status": "no_engine"}
+    try:
+        if hasattr(engine, '_scheduler') and hasattr(engine._scheduler, 'deep_reset'):
+            engine._scheduler.deep_reset()
+        elif hasattr(engine, 'scheduler') and hasattr(engine.scheduler, 'deep_reset'):
+            engine.scheduler.deep_reset()
+        import gc
+        gc.collect()
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except ImportError:
+            pass
+        return {"status": "reset", "caches_cleared": True}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 @app.delete("/v1/cache")
 async def clear_cache():
     """Clear all caches."""
