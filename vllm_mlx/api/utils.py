@@ -33,6 +33,17 @@ _FINAL_CHANNEL_RE = re.compile(
     r"<\|channel\|>final[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>"
 )
 
+# Gemma 4 uses asymmetric channel delimiters: <|channel>NAME\n...<channel|>
+# "thought" channel contains reasoning that should be stripped for Claude Code.
+# "response" channel contains the actual output (rare — usually response is
+# plain text after the thought block ends).
+_GEMMA4_THOUGHT_RE = re.compile(
+    r"<\|channel>\s*thought\b[^<]*(?:<(?!channel\|>)[^<]*)*<channel\|>",
+    re.DOTALL,
+)
+_GEMMA4_RESPONSE_OPEN_RE = re.compile(r"<\|channel>\s*response\b[^\n]*\n?")
+_GEMMA4_RESPONSE_CLOSE_RE = re.compile(r"<channel\|>")
+
 
 def _clean_gpt_oss_output(text: str) -> str:
     """
@@ -71,6 +82,24 @@ def _clean_gpt_oss_output(text: str) -> str:
     return cleaned.strip()
 
 
+def _clean_gemma4_channels(text: str) -> str:
+    """
+    Strip Gemma 4's asymmetric channel tokens.
+
+    Gemma 4 wraps reasoning in `<|channel>thought ...<channel|>` blocks and
+    optionally wraps the user-facing reply in `<|channel>response ...<channel|>`.
+    When VLLM_MLX_ENABLE_THINKING is off, we want to drop the thought channel
+    entirely and unwrap the response channel. This is the Gemma 4 equivalent
+    of the GPT-OSS cleaner above.
+    """
+    # Drop thought blocks completely
+    text = _GEMMA4_THOUGHT_RE.sub("", text)
+    # Unwrap response channel markers (keep the content inside)
+    text = _GEMMA4_RESPONSE_OPEN_RE.sub("", text)
+    text = _GEMMA4_RESPONSE_CLOSE_RE.sub("", text)
+    return text.strip()
+
+
 def clean_output_text(text: str) -> str:
     """
     Clean model output by removing special tokens.
@@ -90,7 +119,11 @@ def clean_output_text(text: str) -> str:
     if not text:
         return text
 
-    # GPT-OSS channel format — extract final content before general stripping
+    # Gemma 4 channel format — asymmetric <|channel>NAME...<channel|>
+    if "<|channel>" in text:
+        text = _clean_gemma4_channels(text)
+
+    # GPT-OSS channel format — symmetric <|channel|>final<|message|>
     if "<|channel|>" in text and "<|message|>" in text:
         text = _clean_gpt_oss_output(text)
         return text
