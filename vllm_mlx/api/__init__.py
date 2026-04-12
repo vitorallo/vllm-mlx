@@ -56,6 +56,7 @@ from .models import (
 
 from .utils import (
     clean_output_text,
+    _clean_gemma4_channels,
     is_mllm_model,
     is_vlm_model,
     extract_multimodal_content,
@@ -115,6 +116,7 @@ __all__ = [
     "EmbeddingResponse",
     # Utils
     "clean_output_text",
+    "_clean_gemma4_channels",
     "is_mllm_model",
     "is_vlm_model",
     "extract_multimodal_content",

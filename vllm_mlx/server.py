@@ -104,6 +104,7 @@ from .api.tool_calling import (
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
+    _clean_gemma4_channels,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -2141,6 +2142,14 @@ async def _stream_anthropic_messages(
     accumulated_text = ""
     completion_tokens = 0
 
+    # Gemma 4 thought-channel suppression state.
+    # Gemma 4 emits `<|channel>thought ... <channel|>` blocks that leak raw
+    # into text_delta events because SPECIAL_TOKENS_PATTERN only matches the
+    # symmetric <|channel|> form. We filter the clean accumulated text on
+    # every delta and emit only the new suffix, holding back a trailing `<`
+    # so a partial marker never sneaks through.
+    gemma4_emitted_len = 0
+
     # Tool call streaming suppression — prevents raw tool markup from leaking
     # as text_delta events. Mirrors the OpenAI streaming path logic.
     global _tool_parser_instance
@@ -2180,7 +2189,27 @@ async def _stream_anthropic_messages(
         if not use_reasoning:
             # Simple path — no reasoning parsing
             accumulated_text += filtered
-            content_to_emit = filtered
+
+            # Gemma 4 thought filter: clean the accumulated text and emit
+            # only the newly-clean suffix. Holding back a trailing `<`
+            # avoids leaking the start of a `<|channel>` marker.
+            if "<|channel>" in accumulated_text or "<channel|>" in accumulated_text:
+                cleaned_total = _clean_gemma4_channels(accumulated_text)
+                safe_end = (
+                    len(cleaned_total) - 1
+                    if cleaned_total.endswith("<")
+                    else len(cleaned_total)
+                )
+                if safe_end > gemma4_emitted_len:
+                    content_to_emit = cleaned_total[gemma4_emitted_len:safe_end]
+                    gemma4_emitted_len = safe_end
+                else:
+                    content_to_emit = ""
+                if not content_to_emit:
+                    continue
+            else:
+                content_to_emit = filtered
+                gemma4_emitted_len += len(filtered)
 
             # Filter tool call markup during streaming
             if tool_parser and content_to_emit:
