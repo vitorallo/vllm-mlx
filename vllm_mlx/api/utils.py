@@ -91,9 +91,25 @@ def _clean_gemma4_channels(text: str) -> str:
     When VLLM_MLX_ENABLE_THINKING is off, we want to drop the thought channel
     entirely and unwrap the response channel. This is the Gemma 4 equivalent
     of the GPT-OSS cleaner above.
+
+    Also handles truncation: if max_tokens cuts a thought block before it
+    closes, everything after the opening `<|channel>thought` is stripped.
     """
-    # Drop thought blocks completely
+    # Drop complete thought blocks
     text = _GEMMA4_THOUGHT_RE.sub("", text)
+
+    # Handle truncated thought blocks: if an opening <|channel>thought remains
+    # without a matching <channel|>, drop everything from the open marker to
+    # either the next channel marker or the end of text.
+    open_idx = text.find("<|channel>thought")
+    if open_idx != -1:
+        # Find the next channel open marker after this one (if any)
+        next_open = text.find("<|channel>", open_idx + 1)
+        if next_open != -1:
+            text = text[:open_idx] + text[next_open:]
+        else:
+            text = text[:open_idx]
+
     # Unwrap response channel markers (keep the content inside)
     text = _GEMMA4_RESPONSE_OPEN_RE.sub("", text)
     text = _GEMMA4_RESPONSE_CLOSE_RE.sub("", text)
