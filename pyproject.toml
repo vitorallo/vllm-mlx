@@ -28,9 +28,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.29.0",
-    "mlx-lm>=0.31.0",  # 0.31+ required for ArraysCache native batching (hybrid models)
-    "mlx-vlm>=0.4.3",  # 0.4.3+ required for Gemma 4 support
+    # PINNED: mlx 0.31.2 breaks GPU streams in ThreadPoolExecutor threads
+    # ("RuntimeError: There is no Stream(gpu, 1) in current thread" during
+    # mx.async_eval), and mlx-lm 0.31.2 broke the BatchGenerator API. mlx-vlm
+    # 0.5.0 hard-requires mlx>=0.31.2 / mlx-lm>=0.31.3, so it must be capped
+    # below 0.5.0 to keep the known-good 0.31.1 stack. 0.4.3+ is still
+    # required for Gemma 4 support.
+    "mlx==0.31.1",
+    "mlx-lm==0.31.1",
+    "mlx-vlm>=0.4.3,<0.5.0",
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
