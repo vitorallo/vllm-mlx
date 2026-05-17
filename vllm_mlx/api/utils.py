@@ -82,6 +82,69 @@ def _clean_gpt_oss_output(text: str) -> str:
     return cleaned.strip()
 
 
+def _find_tool_call_spans(text: str) -> list[tuple[int, int]]:
+    """Return ordered, non-overlapping [start, end) spans of tool-call blocks.
+
+    Uses the same open/close delimiters as the streaming tool-call filter
+    (``_TOOL_CALL_TAGS``). A block whose close tag is absent — generation was
+    truncated mid tool call — extends to end-of-text.
+
+    Channel cleaning must never alter bytes inside these spans: they are a
+    tool call's serialized arguments (e.g. a file body in a Write call) which
+    may legitimately contain ``<|channel>thought`` / ``<channel|>`` substrings,
+    and a tool call following a truncated thought block must not be deleted.
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        best_open = -1
+        best_close = ""
+        for open_tag, close_tag in _TOOL_CALL_TAGS:
+            idx = text.find(open_tag, pos)
+            if idx != -1 and (best_open == -1 or idx < best_open):
+                best_open = idx
+                best_close = close_tag
+        if best_open == -1:
+            break
+        close_idx = text.find(best_close, best_open + 1)
+        if close_idx == -1:
+            spans.append((best_open, n))  # unclosed (truncated) -> to EOF
+            break
+        end = close_idx + len(best_close)
+        spans.append((best_open, end))
+        pos = end
+    return spans
+
+
+def _clean_gemma4_segment(text: str) -> str:
+    """Original Gemma 4 channel stripping, applied to a span-free region.
+
+    Factored out of ``_clean_gemma4_channels`` so it can be applied ONLY to
+    text outside tool-call spans. The truncated-thought slice deletes to the
+    end of THIS segment (segments are split on span boundaries by the caller),
+    so a tool call after a dangling ``<|channel>thought`` survives.
+    """
+    # Drop complete thought blocks
+    text = _GEMMA4_THOUGHT_RE.sub("", text)
+
+    # Handle truncated thought blocks: an opening <|channel>thought with no
+    # matching <channel|> -> drop from the open marker to the next channel
+    # marker, or to the end of this segment.
+    open_idx = text.find("<|channel>thought")
+    if open_idx != -1:
+        next_open = text.find("<|channel>", open_idx + 1)
+        if next_open != -1:
+            text = text[:open_idx] + text[next_open:]
+        else:
+            text = text[:open_idx]
+
+    # Unwrap response channel markers (keep the content inside)
+    text = _GEMMA4_RESPONSE_OPEN_RE.sub("", text)
+    text = _GEMMA4_RESPONSE_CLOSE_RE.sub("", text)
+    return text
+
+
 def _clean_gemma4_channels(text: str) -> str:
     """
     Strip Gemma 4's asymmetric channel tokens.
@@ -94,26 +157,26 @@ def _clean_gemma4_channels(text: str) -> str:
 
     Also handles truncation: if max_tokens cuts a thought block before it
     closes, everything after the opening `<|channel>thought` is stripped.
+
+    Tool-call safety: channel stripping is applied ONLY to text outside
+    tool-call spans. A tool call's serialized arguments may contain literal
+    `<|channel>thought` / `<channel|>` substrings (e.g. a Markdown file about
+    LLMs), and a tool call that follows a truncated (unclosed) thought block
+    must not be erased. With no tool-call markers present the behaviour is
+    byte-for-byte identical to the original (the common Gemma-thinking path).
     """
-    # Drop complete thought blocks
-    text = _GEMMA4_THOUGHT_RE.sub("", text)
+    spans = _find_tool_call_spans(text)
+    if not spans:
+        return _clean_gemma4_segment(text).strip()
 
-    # Handle truncated thought blocks: if an opening <|channel>thought remains
-    # without a matching <channel|>, drop everything from the open marker to
-    # either the next channel marker or the end of text.
-    open_idx = text.find("<|channel>thought")
-    if open_idx != -1:
-        # Find the next channel open marker after this one (if any)
-        next_open = text.find("<|channel>", open_idx + 1)
-        if next_open != -1:
-            text = text[:open_idx] + text[next_open:]
-        else:
-            text = text[:open_idx]
-
-    # Unwrap response channel markers (keep the content inside)
-    text = _GEMMA4_RESPONSE_OPEN_RE.sub("", text)
-    text = _GEMMA4_RESPONSE_CLOSE_RE.sub("", text)
-    return text.strip()
+    out: list[str] = []
+    prev = 0
+    for start, end in spans:
+        out.append(_clean_gemma4_segment(text[prev:start]))
+        out.append(text[start:end])  # tool-call span: verbatim
+        prev = end
+    out.append(_clean_gemma4_segment(text[prev:]))
+    return "".join(out).strip()
 
 
 def clean_output_text(text: str) -> str:

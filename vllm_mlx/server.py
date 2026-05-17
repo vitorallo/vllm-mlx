@@ -167,6 +167,11 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+# Opt-in: when a tool call is truncated by max_tokens (JSON never closes, so no
+# tool_use can be parsed), return an explicit, actionable message instead of
+# silently returning text. Default off — other consumers (e.g. foil) and every
+# non-tool / non-truncated path are unaffected unless this is enabled.
+_tool_call_truncation_notice: bool = False
 
 # Pattern to strip leaked tool call markup from content output.
 # Safety net: the tool parser should consume these, but if it doesn't
@@ -408,6 +413,47 @@ def _validate_model_name(request_model: str) -> None:
             detail=f"The model `{request_model}` does not exist. "
             f"Available model: `{_model_name}`",
         )
+
+
+# Tool-call start markers across supported formats (Gemma4 / Qwen-Hermes /
+# Llama / Mistral / Qwen-bracket). Model-agnostic on purpose.
+_TOOL_START_MARKERS = (
+    "<|tool_call>",
+    "<tool_call>",
+    "<function=",
+    "[TOOL_CALLS]",
+    "[Calling tool",
+)
+
+_TRUNCATED_TOOL_CALL_MESSAGE = (
+    "⚠ The previous tool call was discarded: its output exceeded the "
+    "model's max output tokens, so the tool-call JSON was truncated before it "
+    "closed and could not be executed. Do NOT repeat the same large call. "
+    "Write the file incrementally instead: create it with the first section "
+    "using a single Write, then append each remaining section with separate, "
+    "smaller Write/Edit calls, keeping every individual call well under the "
+    "output-token limit."
+)
+
+
+def _truncated_tool_call_notice(
+    text: str, finish_reason: str | None, had_tool_calls: bool
+) -> str | None:
+    """Return an actionable message iff a tool call was truncated by length.
+
+    Opt-in via ``--tool-call-truncation-notice``. Returns ``None`` (no
+    behaviour change) unless ALL hold: the flag is enabled, no tool call was
+    parsed, generation stopped on ``length`` (max_tokens), and the output
+    contains a tool-call start marker. Model-agnostic; turning silent
+    HTTP-200-text into an explicit instruction the agent can act on.
+    """
+    if not _tool_call_truncation_notice or had_tool_calls:
+        return None
+    if finish_reason != "length":
+        return None
+    if not any(m in text for m in _TOOL_START_MARKERS):
+        return None
+    return _TRUNCATED_TOOL_CALL_MESSAGE
 
 
 def _parse_tool_calls_with_parser(
@@ -1643,6 +1689,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
+    notice = _truncated_tool_call_notice(
+        output.text, output.finish_reason, bool(tool_calls)
+    )
+    if notice:
+        cleaned_text, tool_calls, reasoning_text, finish_reason = (
+            notice,
+            None,
+            None,
+            "stop",
+        )
+
     return ChatCompletionResponse(
         model=_model_name,
         choices=[
@@ -1918,12 +1975,23 @@ async def create_anthropic_message(
                 )
             )
 
+    notice = _truncated_tool_call_notice(
+        output.text, output.finish_reason, bool(tool_calls)
+    )
+    if notice:
+        content_blocks = [
+            AnthropicResponseContentBlock(type="text", text=notice)
+        ]
+
     if not content_blocks:
         content_blocks.append(AnthropicResponseContentBlock(type="text", text=""))
 
-    stop_reason = _convert_anthropic_stop_reason(
-        "tool_calls" if tool_calls else output.finish_reason
-    )
+    if notice:
+        stop_reason = "end_turn"
+    else:
+        stop_reason = _convert_anthropic_stop_reason(
+            "tool_calls" if tool_calls else output.finish_reason
+        )
 
     anthropic_response = AnthropicResponse(
         model=_model_name,
@@ -2301,6 +2369,22 @@ async def _stream_anthropic_messages(
     # Close text block
     if text_block_started:
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
+
+    # Truncated tool call (opt-in): emit an explicit "write in parts" block
+    # instead of silently ending with unusable partial text.
+    last_finish = (
+        getattr(output, "finish_reason", None) if "output" in locals() else None
+    )
+    notice = _truncated_tool_call_notice(
+        accumulated_text, last_finish, bool(tool_calls)
+    )
+    if notice:
+        notice_index = (text_index + 1) if text_block_started else 0
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': notice_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': notice_index, 'delta': {'type': 'text_delta', 'text': notice}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': notice_index})}\n\n"
+        text_block_started = True
+        text_index = notice_index
 
     # If there are tool calls, emit tool_use blocks
     next_index = (text_index + 1) if text_block_started else 0
@@ -2722,6 +2806,29 @@ async def stream_chat_completion(
                 ],
             )
             yield f"data: {tool_chunk.model_dump_json()}\n\n"
+        else:
+            # Truncated tool call (opt-in): surface an actionable message
+            # instead of silently ending with unusable partial text.
+            last_finish = (
+                getattr(output, "finish_reason", None)
+                if "output" in locals()
+                else None
+            )
+            notice = _truncated_tool_call_notice(
+                tool_accumulated_text, last_finish, False
+            )
+            if notice:
+                notice_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_model_name,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(content=notice),
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+                yield f"data: {notice_chunk.model_dump_json()}\n\n"
 
     # Log throughput
     elapsed = time.perf_counter() - start_time
