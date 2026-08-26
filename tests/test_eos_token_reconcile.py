@@ -11,6 +11,8 @@ from vllm_mlx.utils.tokenizer import _ensure_tokenizer_eos
 
 
 class _Tok:
+    """mlx-lm shape: a set in eos_token_ids, extended via add_eos_token."""
+
     def __init__(self, own, known):
         self.eos_token_id = own
         self.eos_token_ids = set(known)
@@ -20,6 +22,28 @@ class _Tok:
     def add_eos_token(self, tid):
         self.added.append(tid)
         self.eos_token_ids.add(tid)
+
+
+class _Criteria:
+    def __init__(self, ids):
+        self.eos_token_ids = list(ids)
+        self.added = []
+
+    def add_eos_token_ids(self, tid):
+        self.added.append(tid)
+        self.eos_token_ids.append(tid)
+
+
+class _VlmTok:
+    """mlx-vlm shape: a StoppingCriteria seeded from the (wrong) model config,
+    plus a bare int eos_token_ids on the raw HF tokenizer."""
+
+    def __init__(self, own, criteria_ids, bare_ids=None):
+        self.eos_token_id = own
+        self.eos_token = "<|im_end|>"
+        self.stopping_criteria = _Criteria(criteria_ids)
+        if bare_ids is not None:
+            self.eos_token_ids = bare_ids
 
 
 def test_missing_own_eos_is_added():
@@ -60,3 +84,38 @@ def test_add_failure_does_not_propagate():
             raise RuntimeError("nope")
 
     _ensure_tokenizer_eos(Boom(own=248046, known={248044}), "m")  # must not raise
+
+
+def test_vlm_stopping_criteria_gets_the_missing_eos():
+    """The container generation actually consults on the mlx-vlm path."""
+    tk = _VlmTok(own=248046, criteria_ids=[248044])
+    _ensure_tokenizer_eos(tk, "m")
+    assert tk.stopping_criteria.added == [248046]
+    assert tk.stopping_criteria.eos_token_ids == [248044, 248046]
+
+
+def test_vlm_already_correct_is_untouched():
+    tk = _VlmTok(own=248046, criteria_ids=[248044, 248046])
+    _ensure_tokenizer_eos(tk, "m")
+    assert tk.stopping_criteria.added == []
+
+
+def test_bare_int_eos_token_ids_does_not_raise():
+    """A raw HF tokenizer exposes eos_token_ids as an int, not a collection.
+
+    An earlier version did ``own in known`` against that int, raised TypeError,
+    swallowed it, and silently did nothing.
+    """
+    tk = _VlmTok(own=248046, criteria_ids=[248044], bare_ids=248046)
+    _ensure_tokenizer_eos(tk, "m")
+    assert tk.stopping_criteria.eos_token_ids == [248044, 248046]
+
+
+def test_criteria_failure_does_not_propagate():
+    class Boom(_Criteria):
+        def add_eos_token_ids(self, tid):
+            raise RuntimeError("nope")
+
+    tk = _VlmTok(own=248046, criteria_ids=[248044])
+    tk.stopping_criteria = Boom([248044])
+    _ensure_tokenizer_eos(tk, "m")  # must not raise

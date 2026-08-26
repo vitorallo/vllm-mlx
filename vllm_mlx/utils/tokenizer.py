@@ -160,42 +160,71 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
 def _ensure_tokenizer_eos(tokenizer, model_name: str):
     """Make sure the tokenizer's own eos token counts as a stop token.
 
-    Some checkpoints ship a ``generation_config.json`` whose ``eos_token_id``
-    omits the token their chat template actually ends turns with. Qwen3
-    derivatives are the common case: config says ``248044``
-    (``<|endoftext|>``) while ``tokenizer_config.json`` says ``eos_token`` is
-    ``<|im_end|>`` (``248046``), and the template emits ``<|im_end|>``. Stock
-    Qwen3.8 lists both; fine-tunes frequently drop one.
+    Some checkpoints ship a config whose ``eos_token_id`` omits the token their
+    chat template actually ends turns with. Qwen3 derivatives are the common
+    case: config says ``248044`` (``<|endoftext|>``) while the tokenizer and
+    template use ``<|im_end|>`` (``248046``). Stock Qwen3.8 lists both;
+    fine-tunes frequently drop one.
 
-    When that happens generation never sees a stop token. It runs past the turn
-    boundary and the model hallucinates the rest of the conversation — emitting
-    "user"/"assistant" role markers and answering itself, until max_tokens.
-    From the user's side the model looks broken rather than misconfigured.
+    Generation then never sees a stop token: it runs past the turn boundary and
+    the model hallucinates the rest of the conversation, emitting
+    "user"/"assistant" role markers and answering itself until max_tokens.
 
-    ``models/llm.py`` has long carried a name-matched ``"qwen3" in name`` fix
-    for this, but it only reaches the pure-LLM path. Anything loading as an
-    MLLM — which includes Qwen3.5/3.8 checkpoints tagged image-text-to-text —
-    bypassed it. Doing it here, after load, covers every caller and every path,
-    with no name matching: union rather than override, so a stop token either
-    source knew about is never lost.
+    Two stop-token containers exist and both must be handled:
+
+    * mlx-lm's ``TokenizerWrapper`` keeps a ``set`` in ``eos_token_ids`` and
+      adds via ``add_eos_token``.
+    * mlx-vlm hangs a ``StoppingCriteria`` off ``tokenizer.stopping_criteria``,
+      seeded from ``model.config`` — which is *precisely* the value that is
+      wrong — and adds via ``add_eos_token_ids``. A raw HF tokenizer also
+      exposes a bare ``eos_token_ids`` int, so membership tests must not assume
+      an iterable.
     """
-    try:
-        own = getattr(tokenizer, "eos_token_id", None)
-        known = getattr(tokenizer, "eos_token_ids", None)
-        if own is None or known is None or own in known:
-            return tokenizer
-        tokenizer.add_eos_token(own)
+    own = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer is None or own is None:
+        return tokenizer
+
+    def _as_list(value):
+        if value is None:
+            return []
+        if isinstance(value, int):
+            return [value]
+        try:
+            return list(value)
+        except TypeError:
+            return []
+
+    changed = []
+
+    # mlx-vlm: the StoppingCriteria is what generation actually consults.
+    criteria = getattr(tokenizer, "stopping_criteria", None)
+    if criteria is not None:
+        current = _as_list(getattr(criteria, "eos_token_ids", None))
+        if own not in current:
+            try:
+                criteria.add_eos_token_ids(own)
+                changed.append(f"stopping_criteria {current} -> {criteria.eos_token_ids}")
+            except Exception as exc:
+                logger.warning("Could not extend stopping_criteria: %s", exc)
+
+    # mlx-lm: TokenizerWrapper's own set.
+    known = _as_list(getattr(tokenizer, "eos_token_ids", None))
+    if known and own not in known and hasattr(tokenizer, "add_eos_token"):
+        try:
+            tokenizer.add_eos_token(own)
+            changed.append(f"eos_token_ids {known} -> {tokenizer.eos_token_ids}")
+        except Exception as exc:
+            logger.warning("Could not extend eos_token_ids: %s", exc)
+
+    if changed:
         logger.info(
-            "eos_token_id from config (%s) did not include the tokenizer's own "
-            "eos %s (%r) for %s; adding it so generation stops at the turn "
-            "boundary",
-            sorted(known),
+            "%s: config eos did not include the tokenizer's own eos %s (%r); "
+            "added it so generation stops at the turn boundary [%s]",
+            model_name,
             own,
             getattr(tokenizer, "eos_token", None),
-            model_name,
+            "; ".join(changed),
         )
-    except Exception as exc:  # never block a load over this
-        logger.debug("Could not reconcile eos token ids: %s", exc)
     return tokenizer
 
 
