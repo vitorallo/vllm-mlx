@@ -110,6 +110,10 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
+    server._tool_call_truncation_notice = bool(
+        getattr(args, "tool_call_truncation_notice", False)
+    )
+
     # Configure generation defaults
     if args.default_temperature is not None:
         server._default_temperature = args.default_temperature
@@ -1349,6 +1353,8 @@ Examples:
             "mistral",
             "qwen",
             "qwen3_coder",
+            "qwen3_xml",
+            "qwen3.5",
             "llama",
             "hermes",
             "harmony",
@@ -1365,10 +1371,22 @@ Examples:
         ],
         help=(
             "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
+            "auto (auto-detect), mistral, qwen, qwen3_coder/qwen3_xml/qwen3.5 "
+            "(Qwen3 XML <function=..><parameter=..> format), llama, hermes, "
             "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
             "xlam, functionary, glm47, minimax. "
             "Required for --enable-auto-tool-choice."
+        ),
+    )
+    serve_parser.add_argument(
+        "--tool-call-truncation-notice",
+        action="store_true",
+        default=False,
+        help=(
+            "When a tool call is truncated by max_tokens (it never closes so "
+            "no tool_use can be parsed), return an explicit 'write the file in "
+            "smaller parts' message instead of silently returning text. "
+            "Opt-in; default off."
         ),
     )
     # Reasoning parser options - choices loaded dynamically from registry
