@@ -18,6 +18,17 @@ import sys
 import pytest
 
 
+class _FakeFunction:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    def __init__(self, name, arguments):
+        self.function = _FakeFunction(name, arguments)
+
+
 @pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
     reason="server import requires Apple Silicon deps",
@@ -78,6 +89,53 @@ class TestTruncatedToolCallNotice:
         s._tool_call_truncation_notice = True
         try:
             assert self._fn()('<tool_call>{"name"', "length", False) is not None
+        finally:
+            s._tool_call_truncation_notice = False
+
+    def test_empty_tool_call_shell_on_truncation_fires(self):
+        """Qwen3 XML parser recognises <function=Write> then runs out of tokens.
+
+        It emits a tool call whose arguments never arrived. Executing that is
+        worse than nothing, so the notice must fire.
+        """
+        import vllm_mlx.server as s
+
+        s._tool_call_truncation_notice = True
+        try:
+            shell = [_FakeToolCall("Write", "{}")]
+            assert self._fn()("<tool_call><function=Write>", "length", shell) is not None
+        finally:
+            s._tool_call_truncation_notice = False
+
+    def test_usable_tool_call_on_truncation_does_not_fire(self):
+        import vllm_mlx.server as s
+
+        s._tool_call_truncation_notice = True
+        try:
+            real = [_FakeToolCall("Write", '{"file_path": "/tmp/x"}')]
+            assert self._fn()("<tool_call><function=Write>", "length", real) is None
+        finally:
+            s._tool_call_truncation_notice = False
+
+    def test_truncated_json_arguments_fire(self):
+        """The dangerous shape: arguments cut off mid-string, JSON never closes."""
+        import vllm_mlx.server as s
+
+        s._tool_call_truncation_notice = True
+        try:
+            partial = [
+                _FakeToolCall("Write", '{"file_path": "/tmp/x.py", "content": "def f(')
+            ]
+            assert self._fn()("<tool_call><function=Write>", "length", partial) is not None
+        finally:
+            s._tool_call_truncation_notice = False
+
+    def test_unknown_tool_call_shape_stays_conservative(self):
+        import vllm_mlx.server as s
+
+        s._tool_call_truncation_notice = True
+        try:
+            assert self._fn()("<tool_call>", "length", [object()]) is None
         finally:
             s._tool_call_truncation_notice = False
 

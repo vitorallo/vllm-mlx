@@ -1814,18 +1814,69 @@ _TRUNCATED_TOOL_CALL_MESSAGE = (
 )
 
 
+def _tool_calls_are_usable(tool_calls) -> bool:
+    """True iff at least one parsed tool call carries complete arguments.
+
+    A tool call cut off by max_tokens can still be *partially* recognised.
+    The Qwen3 XML parser in particular sees ``<function=Write>`` and emits a
+    tool call built from whatever arrived, which leaves two shapes, both
+    unusable:
+
+      - arguments that are empty (``{}``) — the parameters never started;
+      - arguments that are a truncated JSON fragment — the file body was cut
+        off mid-string, so the JSON never closes.
+
+    The second is the dangerous one. ``json.loads`` fails, downstream code
+    falls back to ``{}``, and the agent executes Write with no arguments — or,
+    worse, a consumer that tolerates the fragment writes a silently truncated
+    file. Completeness, not mere presence, is the test: arguments must parse
+    as JSON and be non-empty.
+    """
+    if not tool_calls:
+        return False
+    if tool_calls is True:
+        return True
+    for tc in tool_calls:
+        args = getattr(getattr(tc, "function", None), "arguments", None)
+        if args is None and isinstance(tc, dict):
+            args = (tc.get("function") or {}).get("arguments")
+        if args is None:
+            return True  # unknown shape — assume usable, stay conservative
+        if isinstance(args, str):
+            stripped = args.strip()
+            if not stripped or stripped in ("{}", "null"):
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                continue  # truncated mid-JSON — not usable
+            if parsed:
+                return True
+        elif args:
+            return True
+    return False
+
+
 def _truncated_tool_call_notice(
-    text: str, finish_reason: str | None, had_tool_calls: bool
+    text: str, finish_reason: str | None, tool_calls
 ) -> str | None:
     """Return an actionable message iff a tool call was truncated by length.
 
     Opt-in via ``--tool-call-truncation-notice``. Returns ``None`` (no
-    behaviour change) unless ALL hold: the flag is enabled, no tool call was
-    parsed, generation stopped on ``length`` (max_tokens), and the output
-    contains a tool-call start marker. Model-agnostic; turns silent
-    HTTP-200-text into an explicit instruction the agent can act on.
+    behaviour change) unless ALL hold: the flag is enabled, generation stopped
+    on ``length`` (max_tokens), the output contains a tool-call start marker,
+    and no *usable* tool call was parsed — either none at all, or only
+    argument-less shells left behind by the cut-off (see
+    ``_tool_calls_are_usable``). Model-agnostic; turns a silent HTTP-200 —
+    whether unusable text or an empty tool call — into an explicit
+    instruction the agent can act on.
+
+    ``tool_calls`` accepts the parsed list, or a plain bool for callers that
+    only know whether any were found.
     """
-    if not _tool_call_truncation_notice or had_tool_calls:
+    if not _tool_call_truncation_notice:
+        return None
+    if _tool_calls_are_usable(tool_calls):
         return None
     if finish_reason != "length":
         return None
@@ -5130,7 +5181,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
         notice = _truncated_tool_call_notice(
-            output.text, output.finish_reason, bool(tool_calls)
+            output.text, output.finish_reason, tool_calls
         )
         if notice:
             cleaned_text, tool_calls, reasoning_text, finish_reason = (
@@ -5606,12 +5657,15 @@ async def create_anthropic_message(
                 )
 
         notice = _truncated_tool_call_notice(
-            output.text, output.finish_reason, bool(tool_calls)
+            output.text, output.finish_reason, tool_calls
         )
         if notice:
+            # Replace the truncated shells outright: a tool_use block with
+            # empty input is worse than none, the client would execute it.
             content_blocks = [
                 AnthropicResponseContentBlock(type="text", text=notice)
             ]
+            tool_calls = None
 
         if not content_blocks:
             content_blocks.append(AnthropicResponseContentBlock(type="text", text=""))
@@ -6019,7 +6073,7 @@ async def _stream_anthropic_messages(
             getattr(output, "finish_reason", None) if "output" in locals() else None
         )
         notice = _truncated_tool_call_notice(
-            tool_accumulated_text or accumulated_text, last_finish, bool(tool_calls)
+            tool_accumulated_text or accumulated_text, last_finish, tool_calls
         )
         if notice:
             notice_index = (text_index + 1) if text_block_started else 0
@@ -6028,6 +6082,9 @@ async def _stream_anthropic_messages(
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': notice_index})}\n\n"
             text_block_started = True
             text_index = notice_index
+            # Drop the truncated shells so the client can't execute a tool
+            # call with no arguments; the notice above replaces them.
+            tool_calls = None
 
         # If there are tool calls, emit tool_use blocks
         next_index = (text_index + 1) if text_block_started else 0
