@@ -69,7 +69,8 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         logger.info(
             f"Model {model_name} requires tokenizer fallback, loading directly..."
         )
-        return _load_with_tokenizer_fallback(model_name)
+        m, tk = _load_with_tokenizer_fallback(model_name)
+        return m, _ensure_tokenizer_eos(tk, model_name)
 
     # VLM models (e.g., Qwen3.5) have extra vision weights that cause
     # strict=True to fail.  Skip the first load attempt to avoid loading
@@ -78,7 +79,8 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         logger.info(
             f"Model {model_name} detected as VLM, loading directly with strict=False"
         )
-        return _load_strict_false(model_name, tokenizer_config)
+        m, tk = _load_strict_false(model_name, tokenizer_config)
+        return m, _ensure_tokenizer_eos(tk, model_name)
 
     try:
         model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
@@ -86,7 +88,8 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         # Fallback for models with non-standard tokenizers
         if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
-            return _load_with_tokenizer_fallback(model_name)
+            m, tk = _load_with_tokenizer_fallback(model_name)
+            return m, _ensure_tokenizer_eos(tk, model_name)
         # Fallback for models with extra weights (e.g., vision tower, MTP layers).
         # Retry with strict=False to discard extra weights.
         elif "parameters not in model" in str(e):
@@ -102,13 +105,14 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
             import gc
 
             gc.collect()
-            return _load_strict_false(model_name, tokenizer_config)
+            m, tk = _load_strict_false(model_name, tokenizer_config)
+            return m, _ensure_tokenizer_eos(tk, model_name)
         else:
             raise
 
     # After successful load, check if MTP weights exist but were stripped by sanitize()
     _try_inject_mtp_post_load(model, model_name)
-    return model, tokenizer
+    return model, _ensure_tokenizer_eos(tokenizer, model_name)
 
 
 def _load_strict_false(model_name: str, tokenizer_config: dict = None):
@@ -151,6 +155,48 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
     )
     _try_inject_mtp(model, model_path, config)
     return model, tokenizer
+
+
+def _ensure_tokenizer_eos(tokenizer, model_name: str):
+    """Make sure the tokenizer's own eos token counts as a stop token.
+
+    Some checkpoints ship a ``generation_config.json`` whose ``eos_token_id``
+    omits the token their chat template actually ends turns with. Qwen3
+    derivatives are the common case: config says ``248044``
+    (``<|endoftext|>``) while ``tokenizer_config.json`` says ``eos_token`` is
+    ``<|im_end|>`` (``248046``), and the template emits ``<|im_end|>``. Stock
+    Qwen3.8 lists both; fine-tunes frequently drop one.
+
+    When that happens generation never sees a stop token. It runs past the turn
+    boundary and the model hallucinates the rest of the conversation — emitting
+    "user"/"assistant" role markers and answering itself, until max_tokens.
+    From the user's side the model looks broken rather than misconfigured.
+
+    ``models/llm.py`` has long carried a name-matched ``"qwen3" in name`` fix
+    for this, but it only reaches the pure-LLM path. Anything loading as an
+    MLLM — which includes Qwen3.5/3.8 checkpoints tagged image-text-to-text —
+    bypassed it. Doing it here, after load, covers every caller and every path,
+    with no name matching: union rather than override, so a stop token either
+    source knew about is never lost.
+    """
+    try:
+        own = getattr(tokenizer, "eos_token_id", None)
+        known = getattr(tokenizer, "eos_token_ids", None)
+        if own is None or known is None or own in known:
+            return tokenizer
+        tokenizer.add_eos_token(own)
+        logger.info(
+            "eos_token_id from config (%s) did not include the tokenizer's own "
+            "eos %s (%r) for %s; adding it so generation stops at the turn "
+            "boundary",
+            sorted(known),
+            own,
+            getattr(tokenizer, "eos_token", None),
+            model_name,
+        )
+    except Exception as exc:  # never block a load over this
+        logger.debug("Could not reconcile eos token ids: %s", exc)
+    return tokenizer
 
 
 def _try_inject_mtp(model, model_path, config):
