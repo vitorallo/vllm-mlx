@@ -5613,6 +5613,12 @@ async def create_anthropic_message(
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except EngineBusy as exc:
+            # Same translation the OpenAI endpoints do. Without it a serialized
+            # engine rejecting a concurrent request surfaces as an opaque 500,
+            # which clients treat as fatal rather than retryable.
+            tracker.finish(result="busy")
+            _raise_engine_busy(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
