@@ -3452,6 +3452,23 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
+    # Memory-pressure warning: lets clients trigger POST /v1/reset before a
+    # Metal OOM kills the process. Compared against the GPU's recommended
+    # working set (i.e. iogpu.wired_limit_mb), not against peak usage.
+    memory_warning = None
+    try:
+        import mlx.core as mx
+
+        active_gb = mx.get_active_memory() / (1024**3)
+        limit_gb = mx.device_info()["max_recommended_working_set_size"] / (1024**3)
+        if limit_gb > 0 and active_gb > 0.8 * limit_gb:
+            memory_warning = (
+                f"high_memory_pressure: {active_gb:.1f}GB active "
+                f"of {limit_gb:.1f}GB GPU budget"
+            )
+    except Exception:
+        pass
+
     engine_stats = _engine.get_stats() if _engine else {}
     lifecycle = _get_lifecycle_status()
     health_status = (
@@ -3477,6 +3494,7 @@ async def health():
             else "llm"
         ),
         "engine_type": engine_stats.get("engine_type", "unknown"),
+        "memory_warning": memory_warning,
         "mcp": mcp_info,
     }
     if lifecycle is not None:
@@ -3576,6 +3594,37 @@ async def cache_stats():
             "engine_cache": engine_cache,
             "error": "Cache stats not available (mlx_vlm not loaded)",
         }
+
+
+@app.post("/v1/reset", dependencies=[Depends(verify_api_key)])
+async def reset_engine():
+    """Deep reset: clear all KV caches, prefix caches, and reclaim GPU memory.
+
+    Used by long-running clients (e.g. foil's V2 scanner) that issue many
+    requests in one session and need to drop accumulated cache state before
+    GPU memory pressure turns into a Metal OOM.
+    """
+    engine = _engine
+    if engine is None:
+        return {"status": "no_engine"}
+    try:
+        for attr in ("_scheduler", "scheduler"):
+            scheduler = getattr(engine, attr, None)
+            if scheduler is not None and hasattr(scheduler, "deep_reset"):
+                scheduler.deep_reset()
+                break
+        import gc
+
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except ImportError:
+            pass
+        return {"status": "reset", "caches_cleared": True}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
