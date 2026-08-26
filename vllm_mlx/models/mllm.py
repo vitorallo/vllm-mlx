@@ -1286,10 +1286,33 @@ class MLXMultimodalLM:
             from mlx_vlm import load
             from mlx_vlm.utils import load_config
 
+            from ..utils.tokenizer import _ensure_tokenizer_eos
+
             logger.info(f"Loading MLLM: {self.model_name}")
 
             self.model, self.processor = load(self.model_name)
             self.config = load_config(self.model_name)
+
+            # mlx_vlm derives stop tokens from model.config["eos_token_id"]
+            # alone (see mlx_vlm/utils.py: load_processor(..., eos_token_ids=
+            # getattr(model.config, "eos_token_id", None))). Checkpoints whose
+            # config omits the token their chat template actually ends turns
+            # with therefore never stop: generation runs past the turn boundary
+            # and the model hallucinates the rest of the conversation, emitting
+            # "user"/"assistant" markers and answering itself until max_tokens.
+            #
+            # Qwen3.5 fine-tunes are the common case — config says 248044
+            # (<|endoftext|>) while the tokenizer and template use <|im_end|>
+            # (248046). Stock Qwen3.8 lists both; derivatives drop one.
+            #
+            # Two name-matched fixes for this already exist (models/llm.py and
+            # engine/simple.py), but the first only covers the pure-LLM path and
+            # the second only fires when a text model is derived from the MLLM.
+            # Neither reaches a plain MLLM load, which is how every Qwen3.5/3.8
+            # checkpoint tagged image-text-to-text arrives.
+            _ensure_tokenizer_eos(
+                getattr(self.processor, "tokenizer", None), self.model_name
+            )
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
                 _install_draft_metrics_hooks(self._draft_model)
