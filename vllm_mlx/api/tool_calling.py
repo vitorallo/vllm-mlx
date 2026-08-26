@@ -351,6 +351,39 @@ def parse_tool_calls(
     return cleaned_text, tool_calls if tool_calls else None
 
 
+def _scalarize_schema_types(node: Any) -> Any:
+    """Collapse JSON Schema union types to a single scalar type, recursively.
+
+    JSON Schema allows ``"type": ["string", "null"]``. Claude Code sends
+    optional parameters that way. Many chat templates — Qwen3.5's included —
+    render the schema with plain string concatenation:
+
+        "<type>" + param_details.type + "</type>"
+
+    which raises ``TypeError: can only concatenate str (not "list") to str``
+    inside Jinja and surfaces as an opaque HTTP 500 on every request carrying
+    such a tool. The model never even sees the prompt.
+
+    Prefer the first non-"null" member, since the null branch carries no
+    information a prompt can use. Anything that isn't a list is left alone, so
+    ordinary schemas pass through untouched.
+    """
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if key == "type" and isinstance(value, list):
+                non_null = [t for t in value if t != "null"]
+                out[key] = (
+                    non_null[0] if non_null else (value[0] if value else "string")
+                )
+            else:
+                out[key] = _scalarize_schema_types(value)
+        return out
+    if isinstance(node, list):
+        return [_scalarize_schema_types(v) for v in node]
+    return node
+
+
 def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.
@@ -401,7 +434,10 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
                     "function": {
                         "name": func_name,
                         "description": func_desc,
-                        "parameters": func_params,
+                        # Only the copy handed to the chat template is
+                        # scalarized; the schema used for constrained decoding
+                        # and validation elsewhere keeps its union types.
+                        "parameters": _scalarize_schema_types(func_params),
                     },
                 }
             )
