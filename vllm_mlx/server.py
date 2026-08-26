@@ -5267,6 +5267,45 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
             copy["role"] = role
             merged.append(copy)
 
+    # Hoist any system message that isn't first into the leading system block.
+    # Several chat templates hard-fail on a late system message — Qwen 3.5/3.8
+    # raise TemplateError("System message must be at the beginning."), which
+    # surfaces to the client as an opaque HTTP 500. Claude Code does send one
+    # (and "developer" maps to "system" above, producing more), so without this
+    # the whole session dies on a template exception.
+    #
+    # Merging into the leading block, rather than dropping or demoting to
+    # "user", keeps the instruction text and keeps it classified as an
+    # instruction. Content is preserved in order.
+    if any(m["role"] == "system" for m in merged[1:]):
+        late = [m for m in merged[1:] if m["role"] == "system"]
+        rest = [m for m in merged[1:] if m["role"] != "system"]
+        late_text = "\n\n".join(
+            m["content"] for m in late if isinstance(m.get("content"), str)
+        )
+        non_str = [m for m in late if not isinstance(m.get("content"), str)]
+        if merged[0]["role"] == "system" and isinstance(
+            merged[0].get("content"), str
+        ):
+            if late_text:
+                merged[0]["content"] = (
+                    merged[0]["content"] + "\n\n" + late_text
+                ).strip()
+            merged = [merged[0]] + rest
+        elif late_text:
+            merged = [{"role": "system", "content": late_text}] + [merged[0]] + rest
+        else:
+            merged = [merged[0]] + rest
+        # A non-string (multimodal) system message can't be merged into text;
+        # demote it to "user" so its content still reaches the model.
+        for m in non_str:
+            m["role"] = "user"
+            merged.append(m)
+        logger.debug(
+            f"Hoisted {len(late)} non-leading system message(s) into the "
+            f"leading system block"
+        )
+
     mapped_roles = sum(1 for m in messages if m["role"] in _ROLE_MAP)
     merged_count = len(messages) - len(merged)
     if mapped_roles or merged_count:
